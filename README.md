@@ -179,3 +179,10 @@ identity, and what an expired deadline means. `server.ts` owns all I/O;
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+## More bb plugins
+
+This is one of eight bb plugins I publish — see them all at
+[**vburojevic/bb-plugins**](https://github.com/vburojevic/bb-plugins).
