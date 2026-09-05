@@ -14590,6 +14590,26 @@ function adaptiveTimeoutMs(recentDurationsMs) {
   return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, p90 * 2 + 8e3));
 }
 
+// lib/serial-poll.ts
+function startSerialPoll(work, intervalMs) {
+  let stopped = false;
+  let inFlight = false;
+  const timer = setInterval(() => {
+    if (stopped || inFlight) return;
+    inFlight = true;
+    void Promise.resolve().then(() => {
+      if (!stopped) return work(() => stopped);
+    }).catch(() => {
+    }).finally(() => {
+      inFlight = false;
+    });
+  }, intervalMs);
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+}
+
 // server.ts
 var REALTIME_CHANNEL = "prompt-enhancer";
 var OVERRIDE_KEY = "model-override";
@@ -14862,15 +14882,23 @@ async function plugin(bb) {
     publish(id, "error");
   }
   const progressTimers = /* @__PURE__ */ new Map();
+  let disposed = false;
+  bb.onDispose(() => {
+    disposed = true;
+    for (const stop of progressTimers.values()) stop();
+    progressTimers.clear();
+  });
   function stopProgress(id) {
     const timer = progressTimers.get(id);
     if (timer !== void 0) {
-      clearInterval(timer);
+      timer();
       progressTimers.delete(id);
     }
   }
   const PROGRESS_STABLE_POLLS = 3;
   function startProgress(id, childThreadId) {
+    if (disposed) return;
+    stopProgress(id);
     const startedAt = Date.now();
     let lastSeen = "";
     let stablePolls = 0;
@@ -14885,59 +14913,60 @@ async function plugin(bb) {
       }
       cleanupChildThread(childThreadId);
     }
-    const timer = setInterval(() => {
-      void (async () => {
-        try {
-          const row = byId.get(id);
-          if (row === void 0 || row.status !== "pending") {
-            stopProgress(id);
-            return;
-          }
-          if (Date.now() - startedAt > PROGRESS_MAX_MS) {
-            stopProgress(id);
-            fail(id, "The enhancement took too long and was stopped");
-            cleanupChildThread(childThreadId);
-            return;
-          }
-          const { output } = await bb.sdk.threads.output({
-            threadId: childThreadId
-          });
-          const text = output ?? "";
-          if (text.length > lastSeen.length) {
-            bb.realtime.publish(REALTIME_CHANNEL, {
-              id,
-              status: "progress",
-              text
-            });
-          }
-          stablePolls = text.length > 0 && text === lastSeen ? stablePolls + 1 : 0;
-          lastSeen = text;
-          if (stablePolls >= PROGRESS_STABLE_POLLS) {
-            finalize2(row, text);
-            return;
-          }
-          const child = await bb.sdk.threads.get({ threadId: childThreadId });
-          if (child.status === "idle") {
-            finalize2(row, text);
-          } else if (child.status === "error") {
-            stopProgress(id);
-            let message = "The enhancement thread failed";
-            try {
-              const events = await bb.sdk.threads.events.list({
-                threadId: childThreadId
-              });
-              const lastError = [...events].reverse().find((event) => event.type.includes("error"));
-              const detail = lastError === void 0 ? null : lastError.data.message ?? lastError.data.text ?? null;
-              if (detail) message = detail;
-            } catch {
-            }
-            fail(id, message);
-            cleanupChildThread(childThreadId);
-          }
-        } catch {
+    const timer = startSerialPoll(async (isStopped) => {
+      try {
+        const row = byId.get(id);
+        if (row === void 0 || row.status !== "pending") {
           stopProgress(id);
+          return;
         }
-      })();
+        if (Date.now() - startedAt > PROGRESS_MAX_MS) {
+          stopProgress(id);
+          fail(id, "The enhancement took too long and was stopped");
+          cleanupChildThread(childThreadId);
+          return;
+        }
+        const { output } = await bb.sdk.threads.output({
+          threadId: childThreadId
+        });
+        if (isStopped()) return;
+        const text = output ?? "";
+        if (text.length > lastSeen.length) {
+          bb.realtime.publish(REALTIME_CHANNEL, {
+            id,
+            status: "progress",
+            text
+          });
+        }
+        stablePolls = text.length > 0 && text === lastSeen ? stablePolls + 1 : 0;
+        lastSeen = text;
+        if (stablePolls >= PROGRESS_STABLE_POLLS) {
+          finalize2(row, text);
+          return;
+        }
+        const child = await bb.sdk.threads.get({ threadId: childThreadId });
+        if (isStopped()) return;
+        if (child.status === "idle") {
+          finalize2(row, text);
+        } else if (child.status === "error") {
+          stopProgress(id);
+          let message = "The enhancement thread failed";
+          try {
+            const events = await bb.sdk.threads.events.list({
+              threadId: childThreadId
+            });
+            if (disposed) return;
+            const lastError = [...events].reverse().find((event) => event.type.includes("error"));
+            const detail = lastError === void 0 ? null : lastError.data.message ?? lastError.data.text ?? null;
+            if (detail) message = detail;
+          } catch {
+          }
+          fail(id, message);
+          cleanupChildThread(childThreadId);
+        }
+      } catch {
+        stopProgress(id);
+      }
     }, PROGRESS_POLL_MS);
     progressTimers.set(id, timer);
   }

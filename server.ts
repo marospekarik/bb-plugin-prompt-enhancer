@@ -25,6 +25,7 @@ import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
 import { buildEnhancePrompt } from "./lib/enhance-prompt";
 import { adaptiveTimeoutMs } from "./lib/adaptive-timeout";
+import { startSerialPoll } from "./lib/serial-poll";
 
 const REALTIME_CHANNEL = "prompt-enhancer";
 const OVERRIDE_KEY = "model-override";
@@ -386,12 +387,18 @@ export default async function plugin(bb: BbPluginApi) {
   // enhancement is pending we poll the child thread's partial output and
   // relay growth to the composer. Chunky (~0.6s) but genuine tokens.
   // ---------------------------------------------------------------------
-  const progressTimers = new Map<string, ReturnType<typeof setInterval>>();
+  const progressTimers = new Map<string, () => void>();
+  let disposed = false;
+  bb.onDispose(() => {
+    disposed = true;
+    for (const stop of progressTimers.values()) stop();
+    progressTimers.clear();
+  });
 
   function stopProgress(id: string): void {
     const timer = progressTimers.get(id);
     if (timer !== undefined) {
-      clearInterval(timer);
+      timer();
       progressTimers.delete(id);
     }
   }
@@ -400,6 +407,8 @@ export default async function plugin(bb: BbPluginApi) {
   const PROGRESS_STABLE_POLLS = 3;
 
   function startProgress(id: string, childThreadId: string): void {
+    if (disposed) return;
+    stopProgress(id);
     const startedAt = Date.now();
     let lastSeen = "";
     let stablePolls = 0;
@@ -416,86 +425,87 @@ export default async function plugin(bb: BbPluginApi) {
       cleanupChildThread(childThreadId);
     }
 
-    const timer = setInterval(() => {
-      void (async () => {
-        try {
-          const row = byId.get(id) as EnhancementRow | undefined;
-          if (row === undefined || row.status !== "pending") {
-            stopProgress(id);
-            return;
-          }
-          if (Date.now() - startedAt > PROGRESS_MAX_MS) {
-            // Give the row a terminal state instead of abandoning it as
-            // pending forever: a client resuming this scope must learn that
-            // the run is dead rather than wait on it indefinitely.
-            stopProgress(id);
-            fail(id, "The enhancement took too long and was stopped");
-            cleanupChildThread(childThreadId);
-            return;
-          }
-          const { output } = await bb.sdk.threads.output({
-            threadId: childThreadId,
-          });
-          const text = output ?? "";
-          if (text.length > lastSeen.length) {
-            // Monotonic: only growth is relayed, so the composer never sees
-            // the text shrink or flicker between event-assembly states.
-            bb.realtime.publish(REALTIME_CHANNEL, {
-              id,
-              status: "progress",
-              text,
-            });
-          }
-          stablePolls = text.length > 0 && text === lastSeen ? stablePolls + 1 : 0;
-          lastSeen = text;
-          // Optimistic finish: output is assembled from COMPLETED messages
-          // only, so non-empty text that stays unchanged across several
-          // polls IS the rewrite — the thread just spends multiple further
-          // seconds in provider teardown before thread.idle fires, which
-          // previously left the composer locked and the pill spinning long
-          // after the full text had painted. The idle check below and the
-          // lifecycle events remain as fallbacks (all status-guarded).
-          if (stablePolls >= PROGRESS_STABLE_POLLS) {
-            finalize(row, text);
-            return;
-          }
-          const child = await bb.sdk.threads.get({ threadId: childThreadId });
-          if (child.status === "idle") {
-            finalize(row, text);
-          } else if (child.status === "error") {
-            stopProgress(id);
-            // The child's own error (rate limit, out of credits, provider
-            // failure) is what the user needs to see — a generic "failed"
-            // sends them digging through a thread that is about to be
-            // deleted. thread.failed carries the same text as a fallback.
-            let message = "The enhancement thread failed";
-            try {
-              const events = await bb.sdk.threads.events.list({
-                threadId: childThreadId,
-              });
-              const lastError = [...events]
-                .reverse()
-                .find((event) => event.type.includes("error"));
-              const detail =
-                lastError === undefined
-                  ? null
-                  : ((lastError.data as { message?: string; text?: string })
-                      .message ??
-                    (lastError.data as { text?: string }).text ??
-                    null);
-              if (detail) message = detail;
-            } catch {
-              // Keep the generic message.
-            }
-            fail(id, message);
-            cleanupChildThread(childThreadId);
-          }
-        } catch {
-          // Stale handle or the child is gone — either way stop polling;
-          // the lifecycle events still resolve the enhancement.
+    const timer = startSerialPoll(async (isStopped) => {
+      try {
+        const row = byId.get(id) as EnhancementRow | undefined;
+        if (row === undefined || row.status !== "pending") {
           stopProgress(id);
+          return;
         }
-      })();
+        if (Date.now() - startedAt > PROGRESS_MAX_MS) {
+          // Give the row a terminal state instead of abandoning it as
+          // pending forever: a client resuming this scope must learn that
+          // the run is dead rather than wait on it indefinitely.
+          stopProgress(id);
+          fail(id, "The enhancement took too long and was stopped");
+          cleanupChildThread(childThreadId);
+          return;
+        }
+        const { output } = await bb.sdk.threads.output({
+          threadId: childThreadId,
+        });
+        if (isStopped()) return;
+        const text = output ?? "";
+        if (text.length > lastSeen.length) {
+          // Monotonic: only growth is relayed, so the composer never sees
+          // the text shrink or flicker between event-assembly states.
+          bb.realtime.publish(REALTIME_CHANNEL, {
+            id,
+            status: "progress",
+            text,
+          });
+        }
+        stablePolls = text.length > 0 && text === lastSeen ? stablePolls + 1 : 0;
+        lastSeen = text;
+        // Optimistic finish: output is assembled from COMPLETED messages
+        // only, so non-empty text that stays unchanged across several
+        // polls IS the rewrite — the thread just spends multiple further
+        // seconds in provider teardown before thread.idle fires, which
+        // previously left the composer locked and the pill spinning long
+        // after the full text had painted. The idle check below and the
+        // lifecycle events remain as fallbacks (all status-guarded).
+        if (stablePolls >= PROGRESS_STABLE_POLLS) {
+          finalize(row, text);
+          return;
+        }
+        const child = await bb.sdk.threads.get({ threadId: childThreadId });
+        if (isStopped()) return;
+        if (child.status === "idle") {
+          finalize(row, text);
+        } else if (child.status === "error") {
+          stopProgress(id);
+          // The child's own error (rate limit, out of credits, provider
+          // failure) is what the user needs to see — a generic "failed"
+          // sends them digging through a thread that is about to be
+          // deleted. thread.failed carries the same text as a fallback.
+          let message = "The enhancement thread failed";
+          try {
+            const events = await bb.sdk.threads.events.list({
+              threadId: childThreadId,
+            });
+            if (disposed) return;
+            const lastError = [...events]
+              .reverse()
+              .find((event) => event.type.includes("error"));
+            const detail =
+              lastError === undefined
+                ? null
+                : ((lastError.data as { message?: string; text?: string })
+                    .message ??
+                  (lastError.data as { text?: string }).text ??
+                  null);
+            if (detail) message = detail;
+          } catch {
+            // Keep the generic message.
+          }
+          fail(id, message);
+          cleanupChildThread(childThreadId);
+        }
+      } catch {
+        // Stale handle or the child is gone — either way stop polling;
+        // the lifecycle events still resolve the enhancement.
+        stopProgress(id);
+      }
     }, PROGRESS_POLL_MS);
     progressTimers.set(id, timer);
   }
