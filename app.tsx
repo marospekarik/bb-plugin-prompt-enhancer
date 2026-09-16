@@ -1,4 +1,4 @@
-// bb-plugin-prompt-enhancer — frontend entry.
+// bb-plugin-prompt-enhancer-plus — frontend entry.
 //
 // Adds an "Enhance prompt" button to every composer: it rewrites the draft via
 // the backend (a hidden bb thread). While an enhancement runs the button
@@ -1135,7 +1135,208 @@ function ModelSettingsSection() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Settings section — the enhancer prompt itself
+// ---------------------------------------------------------------------------
+
+interface TemplateState {
+  status: "loading" | "ready" | "failed";
+  template: string;
+  defaultTemplate: string;
+  isCustom: boolean;
+  maxLength: number;
+  variables: readonly { name: string; description: string }[];
+}
+
+/**
+ * The editor for the prompt that steers every rewrite.
+ *
+ * It is a plain textarea rather than a list of toggles on purpose: the whole
+ * value of editing this prompt is being able to say something the shipped one
+ * does not, and that is exactly the freedom a form of checkboxes withholds.
+ * The placeholders are documented beside the field and validated server-side on
+ * save, so an unusable template is refused while the mistake is still in front
+ * of the user rather than failing an enhancement half a minute later.
+ */
+function PromptTemplateSettingsSection() {
+  const rpc = useRpc<typeof rpcContract>();
+  const [state, setState] = useState<TemplateState>({
+    status: "loading",
+    template: "",
+    defaultTemplate: "",
+    isCustom: false,
+    maxLength: 20_000,
+    variables: [],
+  });
+  /** The saved template, kept so Discard has something to restore to. */
+  const [saved, setSaved] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const result = await rpc.call("getPromptTemplate");
+        if (cancelled) return;
+        setState({
+          status: "ready",
+          template: result.template,
+          defaultTemplate: result.defaultTemplate,
+          isCustom: result.isCustom,
+          maxLength: result.maxLength,
+          variables: result.variables,
+        });
+        setSaved(result.template);
+      } catch {
+        if (!cancelled) setState((current) => ({ ...current, status: "failed" }));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [rpc]);
+
+  const dirty = state.status === "ready" && state.template !== saved;
+
+  async function save(): Promise<void> {
+    if (busy || !dirty) return;
+    setBusy(true);
+    try {
+      await rpc.call("setPromptTemplate", { template: state.template });
+      setSaved(state.template);
+      setState((current) => ({ ...current, isCustom: true }));
+      toast.success("Enhancer prompt saved", { id: "prompt-enhancer-template" });
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to save the prompt",
+        { id: "prompt-enhancer-template" },
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function restoreShipped(): Promise<void> {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await rpc.call("resetPromptTemplate");
+      const shipped = state.defaultTemplate;
+      setState((current) => ({
+        ...current,
+        template: shipped,
+        isCustom: false,
+      }));
+      setSaved(shipped);
+      toast.success("Restored the shipped prompt", {
+        id: "prompt-enhancer-template",
+      });
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to restore the prompt",
+        { id: "prompt-enhancer-template" },
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (state.status === "loading") {
+    return <p className="text-xs text-muted-foreground">Loading the prompt…</p>;
+  }
+  if (state.status === "failed") {
+    return (
+      <p className="text-xs text-muted-foreground">
+        Couldn&apos;t load the enhancer prompt.
+      </p>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      <p className="text-xs text-muted-foreground">
+        The instruction the rewriter runs on. Every enhancement uses this
+        template; placeholders fill in the per-draft parts.{" "}
+        {state.isCustom ? (
+          <span className="font-medium text-foreground">Edited.</span>
+        ) : (
+          <span className="font-medium text-foreground">
+            Using the shipped prompt.
+          </span>
+        )}
+      </p>
+      <textarea
+        value={state.template}
+        spellCheck={false}
+        onChange={(event) =>
+          setState((current) => ({ ...current, template: event.target.value }))
+        }
+        aria-label="Enhancer prompt template"
+        className={cn(
+          "min-h-64 w-full resize-y rounded-md border border-input bg-transparent p-3",
+          "font-mono text-xs leading-relaxed",
+          "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+        )}
+      />
+      <div className="flex flex-wrap items-center gap-2">
+        <Button size="sm" disabled={busy || !dirty} onClick={() => void save()}>
+          Save
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={busy || !dirty}
+          onClick={() => setState((current) => ({ ...current, template: saved }))}
+        >
+          Discard changes
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={busy || !state.isCustom}
+          onClick={() => void restoreShipped()}
+        >
+          Restore shipped prompt
+        </Button>
+        <span className="ml-auto text-xs text-muted-foreground">
+          {state.template.length.toLocaleString()} /{" "}
+          {state.maxLength.toLocaleString()} characters
+        </span>
+      </div>
+      <details className="rounded-md border border-input p-2">
+        <summary className="cursor-pointer text-xs font-medium">
+          Placeholders
+        </summary>
+        <dl className="mt-2 space-y-1">
+          {state.variables.map((variable) => (
+            <div key={variable.name} className="text-xs">
+              <dt className="inline font-mono text-foreground">
+                {`{{${variable.name}}}`}
+              </dt>{" "}
+              <dd className="inline text-muted-foreground">
+                — {variable.description}
+              </dd>
+            </div>
+          ))}
+        </dl>
+        <p className="mt-2 text-xs text-muted-foreground">
+          A placeholder alone on its own line takes the whole line with it when
+          there is nothing to put there, so optional rules leave no gaps behind.
+          <span className="font-mono"> {`{{draft}}`}</span> is required.
+        </p>
+      </details>
+    </div>
+  );
+}
+
 export default definePluginApp((app) => {
+  app.slots.settingsSection({
+    id: "prompt",
+    title: "Enhancer prompt",
+    description:
+      "Edit the instruction that rewrites your drafts. Placeholders fill in the draft and the conversation context.",
+    component: PromptTemplateSettingsSection,
+  });
   app.slots.settingsSection({
     id: "model",
     title: "Enhancer model",

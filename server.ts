@@ -1,4 +1,8 @@
-// bb-plugin-prompt-enhancer — backend entry.
+// bb-plugin-prompt-enhancer-plus — backend entry.
+//
+// Fork of bb-plugin-prompt-enhancer by Vedran Burojevic (MIT). This fork adds
+// one thing: the enhancer prompt itself is editable, in Settings and from the
+// CLI, instead of being fixed at build time.
 //
 // Rewrites the composer's draft prompt into a clearer, more effective prompt
 // using a HIDDEN bb child thread with the same provider as the current thread
@@ -23,12 +27,20 @@
 // is inherited and the model stays at that provider's default.
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
-import { buildEnhancePrompt } from "./lib/enhance-prompt";
+import {
+  buildEnhancePrompt,
+  DEFAULT_PROMPT_TEMPLATE,
+  TEMPLATE_CAP,
+  TEMPLATE_VARIABLES,
+  validatePromptTemplate,
+} from "./lib/enhance-prompt";
 import { adaptiveTimeoutMs } from "./lib/adaptive-timeout";
 import { startSerialPoll } from "./lib/serial-poll";
 
 const REALTIME_CHANNEL = "prompt-enhancer";
 const OVERRIDE_KEY = "model-override";
+/** The user's own enhancer prompt template; absent means the shipped default. */
+const TEMPLATE_KEY = "prompt-template";
 const CATALOG_TTL_MS = 60_000;
 /** Persisted catalog survives plugin reloads so handlers never cold-fetch. */
 const CATALOG_CACHE_KEY = "model-catalog-cache";
@@ -198,6 +210,32 @@ export const rpcContract = defineRpcContract({
   getPrefs: {
     input: z.null(),
     output: z.object({ previewBeforeApply: z.boolean() }),
+  },
+  /**
+   * The editable enhancer prompt: the effective template, whether it is the
+   * shipped default or the user's own, and the placeholder vocabulary the
+   * settings UI documents.
+   */
+  getPromptTemplate: {
+    input: z.null(),
+    output: z.object({
+      template: z.string(),
+      defaultTemplate: z.string(),
+      isCustom: z.boolean(),
+      maxLength: z.number(),
+      variables: z.array(
+        z.object({ name: z.string(), description: z.string() }),
+      ),
+    }),
+  },
+  setPromptTemplate: {
+    input: z.object({ template: z.string().max(TEMPLATE_CAP) }).strict(),
+    output: z.object({}),
+  },
+  /** Drop the user's template and go back to the shipped one. */
+  resetPromptTemplate: {
+    input: z.null(),
+    output: z.object({}),
   },
 });
 
@@ -652,6 +690,31 @@ export default async function plugin(bb: BbPluginApi) {
   void refreshCatalog().catch(() => {});
 
   /**
+   * The template an enhancement should use: the user's saved one when it is
+   * usable, otherwise the shipped default. A saved template is re-validated on
+   * read, so one written by an older version, or edited out of band, degrades
+   * to the default instead of breaking the enhancement it was meant to steer.
+   */
+  async function loadPromptTemplate(): Promise<{
+    template: string;
+    isCustom: boolean;
+  }> {
+    try {
+      const stored = await bb.storage.kv.get<string>(TEMPLATE_KEY);
+      if (typeof stored === "string") {
+        const check = validatePromptTemplate(stored);
+        if (check.ok) return { template: stored, isCustom: true };
+        bb.log.warn(
+          `ignoring an unusable saved prompt template: ${check.errors.join(" ")}`,
+        );
+      }
+    } catch {
+      // Unreadable storage (stale handle mid-reload) → shipped default.
+    }
+    return { template: DEFAULT_PROMPT_TEMPLATE, isCustom: false };
+  }
+
+  /**
    * Detached kickoff. It MUST swallow every error itself: a stale bb handle or
    * a closed db after a plugin reload must never become an unhandled
    * rejection (PluginContextStaleError can crash the whole bb server).
@@ -697,9 +760,10 @@ export default async function plugin(bb: BbPluginApi) {
       if (resolvedProjectId === null) {
         throw new Error("No project available to run the enhancement in");
       }
-      const [override, settingsValues] = await Promise.all([
+      const [override, settingsValues, promptTemplate] = await Promise.all([
         bb.storage.kv.get<ModelOverride>(OVERRIDE_KEY).then((v) => v ?? null),
         settings.get(),
+        loadPromptTemplate(),
       ]);
       const customRaw = (settingsValues.customInstructions ?? "").trim();
       // The builder caps the length itself; only presence matters here.
@@ -728,13 +792,17 @@ export default async function plugin(bb: BbPluginApi) {
         // belongs in the composer draft, never the timeline.
         visibility: "hidden",
         title: "Enhance prompt",
-        prompt: buildEnhancePrompt(text, {
-          kind: threadId === null ? "new-task" : "follow-up",
-          attachmentCount,
-          threadTitle,
-          lastOutput,
-          customInstructions,
-        }),
+        prompt: buildEnhancePrompt(
+          text,
+          {
+            kind: threadId === null ? "new-task" : "follow-up",
+            attachmentCount,
+            threadTitle,
+            lastOutput,
+            customInstructions,
+          },
+          promptTemplate.template,
+        ),
       });
       setChildThread.run(child.id, id);
       // The user may have cancelled while spawn was in flight; the child is
@@ -877,6 +945,32 @@ export default async function plugin(bb: BbPluginApi) {
       const settingsValues = await settings.get();
       return { previewBeforeApply: settingsValues.previewBeforeApply };
     },
+    async getPromptTemplate() {
+      const { template, isCustom } = await loadPromptTemplate();
+      return {
+        template,
+        defaultTemplate: DEFAULT_PROMPT_TEMPLATE,
+        isCustom,
+        maxLength: TEMPLATE_CAP,
+        variables: TEMPLATE_VARIABLES.map((entry) => ({ ...entry })),
+      };
+    },
+    async setPromptTemplate({ template }) {
+      // Validated here, not just in the UI: the CLI and any other RPC caller
+      // reach this method without passing through the settings page, and a
+      // template missing {{draft}} would spend a hidden thread to rewrite
+      // nothing.
+      const check = validatePromptTemplate(template);
+      if (!check.ok) {
+        throw new Error(check.errors.join(" "));
+      }
+      await bb.storage.kv.set(TEMPLATE_KEY, template);
+      return {};
+    },
+    async resetPromptTemplate() {
+      await bb.storage.kv.delete(TEMPLATE_KEY);
+      return {};
+    },
   });
 
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
@@ -899,5 +993,124 @@ export default async function plugin(bb: BbPluginApi) {
     stopProgress(row.id);
     fail(row.id, error ?? "The enhancement thread failed");
     cleanupChildThread(thread.id);
+  });
+
+  // ---------------------------------------------------------------------
+  // CLI: the enhancer prompt, editable without the UI.
+  //
+  // The template is long, multi-line, and full of characters a shell mangles,
+  // so the editing path is a file rather than an argv string: `show` writes the
+  // effective template to stdout for redirection, `set` reads a file back.
+  // Both are server-side reads of a path that names a file on the INVOKING
+  // machine, which is why the file is read through bb.sdk.files with the
+  // resolved host rather than with node:fs.
+  // ---------------------------------------------------------------------
+  const VARIABLE_HELP = TEMPLATE_VARIABLES.map(
+    (entry) => `  {{${entry.name}}} — ${entry.description}`,
+  ).join("\n");
+
+  async function invokingHostId(threadId: string | null): Promise<string | null> {
+    if (threadId === null) return null;
+    try {
+      const thread = await bb.sdk.threads.get({ threadId });
+      if (thread.environmentId === null) return null;
+      const environment = await bb.sdk.environments.get({
+        environmentId: thread.environmentId,
+      });
+      return environment.hostId ?? null;
+    } catch {
+      // An unresolvable host falls back to the SDK's primary host.
+      return null;
+    }
+  }
+
+  bb.cli.register({
+    name: "prompt-enhancer-plus",
+    summary: "Inspect and edit the enhancer prompt template",
+    commands: [
+      {
+        name: "prompt",
+        summary: "Print the enhancer prompt template in effect",
+        usage: "bb prompt-enhancer-plus prompt [--default]",
+      },
+      {
+        name: "prompt-set",
+        summary: "Replace the enhancer prompt template from a file",
+        usage: "bb prompt-enhancer-plus prompt-set <file>",
+      },
+      {
+        name: "prompt-reset",
+        summary: "Restore the shipped enhancer prompt template",
+        usage: "bb prompt-enhancer-plus prompt-reset",
+      },
+    ],
+    async run(argv, ctx) {
+      const [sub, ...rest] = argv;
+      switch (sub) {
+        case "prompt": {
+          const wantDefault = rest.includes("--default");
+          const template = wantDefault
+            ? DEFAULT_PROMPT_TEMPLATE
+            : (await loadPromptTemplate()).template;
+          return { exitCode: 0, stdout: template };
+        }
+        case "prompt-set": {
+          const path = rest.find((entry) => !entry.startsWith("--"));
+          if (path === undefined) {
+            return {
+              exitCode: 1,
+              stderr: "Usage: bb prompt-enhancer-plus prompt-set <file>",
+            };
+          }
+          let template: string;
+          try {
+            const hostId = await invokingHostId(ctx.threadId ?? null);
+            const file = await bb.sdk.files.read({
+              path,
+              ...(hostId === null ? {} : { hostId }),
+            });
+            template = file.content;
+          } catch (error) {
+            const message =
+              error instanceof Error ? error.message : String(error);
+            return { exitCode: 1, stderr: `Could not read ${path}: ${message}` };
+          }
+          const check = validatePromptTemplate(template);
+          if (!check.ok) {
+            return {
+              exitCode: 1,
+              stderr: [
+                ...check.errors,
+                "",
+                "Placeholders:",
+                VARIABLE_HELP,
+              ].join("\n"),
+            };
+          }
+          await bb.storage.kv.set(TEMPLATE_KEY, template);
+          return {
+            exitCode: 0,
+            stdout: `Saved ${template.length} characters. Run \`bb prompt-enhancer-plus prompt\` to verify, or \`bb prompt-enhancer-plus prompt-reset\` to undo.`,
+          };
+        }
+        case "prompt-reset": {
+          await bb.storage.kv.delete(TEMPLATE_KEY);
+          return { exitCode: 0, stdout: "Restored the shipped prompt." };
+        }
+        default:
+          return {
+            exitCode: 1,
+            stderr: [
+              "Usage:",
+              "  bb prompt-enhancer-plus prompt [--default]",
+              "  bb prompt-enhancer-plus prompt-set <file>",
+              "  bb prompt-enhancer-plus prompt-reset",
+              "",
+              "Placeholders:",
+              VARIABLE_HELP,
+            ].join("\n"),
+          };
+      }
+    },
   });
 }

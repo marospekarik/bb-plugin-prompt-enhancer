@@ -1,4 +1,4 @@
-# Prompt Enhancer
+# Prompt Enhancer Plus
 
 A spark button in every [bb](https://getbb.app) composer that rewrites your
 rough draft into a prompt worth sending — in place, in the composer you are
@@ -7,22 +7,86 @@ already typing in.
 The rewriter is a hidden bb thread, so it runs on the provider you already
 have configured. No API keys, no external service, nothing leaves your bb.
 
+> **This is a fork of [bb-plugin-prompt-enhancer](https://github.com/vburojevic/bb-plugin-prompt-enhancer)
+> by Vedran Burojevic (MIT).** Upstream is a finished, well-built plugin; this
+> fork changes exactly one thing: **the enhancer prompt is editable**, in
+> Settings and from the CLI, instead of being fixed at build time. Everything
+> else — the composer action, the reveal animation, the dropped-reference
+> guard, the model picker — is upstream's work, unchanged. See
+> [Editing the enhancer prompt](#editing-the-enhancer-prompt).
+
 ![A rough one-line draft rewritten into a brief with a "Done when:" list](assets/screenshots/hero.png)
 
 ## Install
 
-Find it in **Settings → Community** once the marketplace listing lands, or
-install it straight from git today:
-
 ```
-bb plugin install git:https://github.com/vburojevic/bb-plugin-prompt-enhancer.git@main
+bb plugin install git:https://github.com/marospekarik/bb-plugin-prompt-enhancer.git@main
 ```
 
-`bb` git installs take an explicit ref, so pin a release instead if you prefer:
-`…bb-plugin-prompt-enhancer.git@v0.2.4`.
+The plugin id is `prompt-enhancer-plus`, so it installs **beside** upstream
+`prompt-enhancer` rather than replacing it. Only enable one of the two — they
+both add a spark button to every composer, and two buttons that do the same
+thing is a worse draft area, not a better one.
 
-Then click the spark in any composer — or press **⌘E** (**Ctrl+E** on
+Then click the spark in any composer — or press **⌘E** (**Ctrl+E on
 Windows and Linux) while the composer is focused.
+
+## Editing the enhancer prompt
+
+Upstream hardcodes the instruction the rewriter runs on. This fork turns that
+instruction into a **template you own**, so the plugin adapts to how you
+actually write prompts instead of the other way round.
+
+Open **Settings → Prompt Enhancer Plus → Enhancer prompt**. The shipped prompt
+is there, in a textarea, editable. Edit it, click **Save**, and every
+subsequent enhancement uses your version. **Restore shipped prompt** puts the
+original back.
+
+The template is plain text. The per-draft facts come in through placeholders,
+which you can place anywhere — or delete, if you don't want that input:
+
+| Placeholder | What it becomes |
+| --- | --- |
+| `{{draft}}` | The draft prompt, truncated at 8000 characters. **Required.** |
+| `{{kindRule}}` | The follow-up vs brand-new-task rule, chosen from where the draft was typed. |
+| `{{context}}` | Thread title and the tail of the last reply, for resolving vague references. |
+| `{{attachmentRule}}` | The attachments rule, present only when the draft carries any. |
+| `{{customRule}}` | Your "Custom rewrite instructions" preference, if set. |
+
+A placeholder alone on its own line takes that whole line with it when there
+is nothing to put there, so optional rules leave no blank gaps behind. A
+template missing `{{draft}}`, or naming a placeholder that does not exist, is
+refused at save time — with the reason — rather than quietly producing a
+broken enhancement.
+
+The same thing from the CLI, which is also the convenient way to keep your
+prompt in version control:
+
+```
+bb prompt-enhancer-plus prompt              # the template in effect
+bb prompt-enhancer-plus prompt --default    # the shipped one, for reference
+bb prompt-enhancer-plus prompt-set my-prompt.txt
+bb prompt-enhancer-plus prompt-reset
+```
+
+### An example
+
+Shipped prompt too chatty for you? Replace the whole thing:
+
+```
+Rewrite this for a coding agent. Output one line, no preamble.
+
+{{kindRule}}
+{{customRule}}
+
+Draft:
+"""
+{{draft}}
+"""
+```
+
+Both surfaces write the same stored value, so a template saved in the UI shows
+up in `bb prompt-enhancer-plus prompt` and vice versa.
 
 ## It picks the shape from the draft
 
@@ -124,7 +188,7 @@ By default the rewrite runs on the provider of the thread you are drafting in
 (or the project default on the new-thread composer), at that provider's default
 model.
 
-Pin something else under **Settings → Prompt Enhancer**. Picking a model
+Pin something else under **Settings → Prompt Enhancer Plus**. Picking a model
 reveals its reasoning levels in their own group — the same progressive
 disclosure bb's own model picker uses. It lives in settings rather than beside
 the draft because it is a set-once preference: the composer keeps a single
@@ -134,14 +198,15 @@ button.
 
 **Custom rewrite instructions** appends a standing instruction to every rewrite
 — `keep prompts under 100 words`, `always write in German`, whatever you keep
-asking for.
+asking for. Unlike the template, this lands as a single `User preference:` rule
+inside it, so it composes with any template rather than replacing it.
 
 Both are also reachable from the CLI:
 
 ```
-bb plugin config prompt-enhancer
-bb plugin config prompt-enhancer set previewBeforeApply true
-bb plugin config prompt-enhancer set customInstructions "keep prompts under 100 words"
+bb plugin config prompt-enhancer-plus
+bb plugin config prompt-enhancer-plus set previewBeforeApply true
+bb plugin config prompt-enhancer-plus set customInstructions "keep prompts under 100 words"
 ```
 
 ## Details
@@ -149,7 +214,8 @@ bb plugin config prompt-enhancer set customInstructions "keep prompts under 100 
 - **Motion** — every animation collapses to an instant text swap under
   `prefers-reduced-motion`.
 - **Long drafts** — the draft is capped at 8000 characters in the rewrite
-  prompt; custom instructions at 500, so they can't dominate it.
+  prompt; custom instructions at 500, so they can't dominate it. The template
+  itself is capped at 20,000 characters.
 - **Language** — the rewrite stays in the language the draft was written in.
 - **Enhance while busy** — you can enhance a draft while the agent is still
   running its previous turn.
@@ -163,14 +229,29 @@ bb plugin config prompt-enhancer set customInstructions "keep prompts under 100 
 npm install
 npm test              # pure logic in lib/, on Node's built-in test runner
 bb plugin build       # dist/server.js + dist/app.js
-bb plugin install .
-bb plugin reload prompt-enhancer
+bb plugin install path:. --yes
+bb plugin reload prompt-enhancer-plus
 ```
 
-The interesting logic is pure and unit-tested in `lib/`: prompt construction,
-the dropped-reference guard, reveal pacing, adaptive timeouts, composer-scope
-identity, and what an expired deadline means. `server.ts` owns all I/O;
-`app.tsx` owns the composer UI.
+The interesting logic is pure and unit-tested in `lib/`: prompt construction
+and template rendering, the dropped-reference guard, reveal pacing, adaptive
+timeouts, composer-scope identity, and what an expired deadline means.
+`server.ts` owns all I/O; `app.tsx` owns the composer UI and the two settings
+sections.
+
+### The default prompt is pinned to upstream
+
+`tests/goldens/default-prompts.json` records `buildEnhancePrompt`'s output —
+generated from the **pre-template upstream implementation** — for a matrix of
+21 inputs covering both kinds, every context combination, attachments, custom
+instructions, truncation boundaries, and quoting edge cases.
+`tests/enhance-prompt-default.test.ts` replays that matrix through the
+templated version and asserts the output is byte-identical.
+
+That test is what makes the fork's central claim checkable: **if you never open
+the setting, you get exactly upstream's behavior.** Turning the prompt into a
+template is a refactor, not a behavior change, and the goldens are the proof.
+Regenerate them only against a deliberately re-derived default.
 
 `types/` holds the bundled bb plugin API declarations, mapped to
 `@bb/plugin-sdk` by `tsconfig.json`. Refresh them from your bb with
@@ -178,11 +259,11 @@ identity, and what an expired deadline means. `server.ts` owns all I/O;
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Original work copyright Vedran Burojevic; fork
+modifications under the same license.
 
 ---
 
 ## More bb plugins
 
-See every bb plugin I publish at
-[**vburojevic/bb-plugins**](https://github.com/vburojevic/bb-plugins).
+Upstream's other plugins: [**vburojevic/bb-plugins**](https://github.com/vburojevic/bb-plugins).

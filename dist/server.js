@@ -14530,49 +14530,135 @@ config(en_default());
 // lib/enhance-prompt.ts
 var PROMPT_TEXT_CAP = 8e3;
 var CUSTOM_INSTRUCTIONS_CAP = 500;
-function buildEnhancePrompt(draft, ctx) {
+var TEMPLATE_CAP = 2e4;
+var TEMPLATE_VARIABLES = [
+  {
+    name: "kindRule",
+    description: "The follow-up vs brand-new-task rule, chosen from where the draft was typed."
+  },
+  {
+    name: "context",
+    description: "Thread title and the tail of the last reply, for resolving vague references. The whole block (and the blank line above it) disappears when there is no context."
+  },
+  {
+    name: "attachmentRule",
+    description: "The rule about attachments, present only when the draft carries any."
+  },
+  {
+    name: "customRule",
+    description: 'Your "Custom rewrite instructions" preference from this settings page, if set.'
+  },
+  {
+    name: "draft",
+    description: "The draft prompt itself, truncated at 8000 characters."
+  }
+];
+var REQUIRED_TEMPLATE_VARIABLES = ["draft"];
+var PLACEHOLDER = /\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g;
+var PLACEHOLDER_ONLY_LINE = /^\s*\{\{\s*([A-Za-z0-9_]+)\s*\}\}\s*$/;
+var KNOWN_VARIABLES = new Set(TEMPLATE_VARIABLES.map((entry) => entry.name));
+function variableNamesIn(template) {
+  const found = /* @__PURE__ */ new Set();
+  for (const match of template.matchAll(PLACEHOLDER)) {
+    found.add(match[1]);
+  }
+  return found;
+}
+function validatePromptTemplate(template) {
+  const errors = [];
+  if (template.trim().length === 0) {
+    errors.push("The template is empty.");
+  }
+  if (template.length > TEMPLATE_CAP) {
+    errors.push(
+      `The template is ${template.length} characters; the limit is ${TEMPLATE_CAP}.`
+    );
+  }
+  const used = variableNamesIn(template);
+  for (const name of used) {
+    if (!KNOWN_VARIABLES.has(name)) {
+      errors.push(
+        `Unknown placeholder {{${name}}}. Known placeholders: ${TEMPLATE_VARIABLES.map(
+          (entry) => `{{${entry.name}}}`
+        ).join(", ")}.`
+      );
+    }
+  }
+  for (const name of REQUIRED_TEMPLATE_VARIABLES) {
+    if (!used.has(name)) {
+      errors.push(`The template must contain {{${name}}}.`);
+    }
+  }
+  if (!used.has("kindRule")) {
+    errors.push(
+      "The template should contain {{kindRule}}, or follow-ups stop being treated as follow-ups."
+    );
+  }
+  return errors.length === 0 ? { ok: true } : { ok: false, errors };
+}
+var DEFAULT_PROMPT_TEMPLATE = [
+  "You rewrite rough draft prompts into clear, effective prompts for a coding agent working in an agentic coding IDE.",
+  "",
+  "{{kindRule}}",
+  "{{context}}",
+  "",
+  "Rules:",
+  "- Preserve the draft's intent and meaning exactly; never invent requirements, constraints, file names, or technologies the draft does not imply.",
+  "- Preserve verbatim every @mention, file path, identifier, code snippet, shell command, URL, and quoted string \u2014 they are live references that must survive untouched.",
+  "- Choose the rewrite's shape from the draft itself: a simple ask stays roughly one line; genuinely multi-part work becomes a short brief (goal, constraints, acceptance criteria); append a 'Done when:' list only when the draft implies concrete, checkable outcomes.",
+  "- Prefer concrete, actionable phrasing: what to do, where, and how to tell it's done.",
+  "- Keep the same language the draft is written in.",
+  "{{attachmentRule}}",
+  "{{customRule}}",
+  "- Return ONLY the rewritten prompt: no preamble, no explanation, no quotes, no markdown fences.",
+  "",
+  "Draft prompt:",
+  '"""',
+  "{{draft}}",
+  '"""'
+].join("\n");
+function templateValues(draft, ctx) {
   const capped = draft.length > PROMPT_TEXT_CAP ? `${draft.slice(0, PROMPT_TEXT_CAP)}
 [\u2026truncated]` : draft;
-  const lines = [
-    "You rewrite rough draft prompts into clear, effective prompts for a coding agent working in an agentic coding IDE.",
-    "",
-    ctx.kind === "follow-up" ? "This draft is a follow-up message in an ongoing conversation \u2014 the agent already has the full context. Keep it a follow-up: sharpen the ask, but do NOT restate background, re-explain the task, or expand it into a standalone spec." : "This draft starts a brand-new task; the rewritten prompt is the agent's entire brief, so make the goal and the definition of done unmistakable."
+  const contextLines = [
+    'Conversation context \u2014 use it ONLY to resolve vague references in the draft ("that bug", "the second option"); never restate it in the rewrite:',
+    ...ctx.threadTitle !== null ? [`Thread title: ${ctx.threadTitle}`] : [],
+    ...ctx.lastOutput !== null ? ["Latest assistant message (tail):", '"""', ctx.lastOutput, '"""'] : []
   ];
-  if (ctx.threadTitle !== null || ctx.lastOutput !== null) {
-    lines.push(
-      "",
-      'Conversation context \u2014 use it ONLY to resolve vague references in the draft ("that bug", "the second option"); never restate it in the rewrite:',
-      ...ctx.threadTitle !== null ? [`Thread title: ${ctx.threadTitle}`] : [],
-      ...ctx.lastOutput !== null ? ["Latest assistant message (tail):", '"""', ctx.lastOutput, '"""'] : []
-    );
-  }
-  lines.push(
-    "",
-    "Rules:",
-    "- Preserve the draft's intent and meaning exactly; never invent requirements, constraints, file names, or technologies the draft does not imply.",
-    "- Preserve verbatim every @mention, file path, identifier, code snippet, shell command, URL, and quoted string \u2014 they are live references that must survive untouched.",
-    "- Choose the rewrite's shape from the draft itself: a simple ask stays roughly one line; genuinely multi-part work becomes a short brief (goal, constraints, acceptance criteria); append a 'Done when:' list only when the draft implies concrete, checkable outcomes.",
-    "- Prefer concrete, actionable phrasing: what to do, where, and how to tell it's done.",
-    "- Keep the same language the draft is written in."
-  );
-  if (ctx.attachmentCount > 0) {
-    lines.push(
-      `- The draft carries ${ctx.attachmentCount} attachment(s) you cannot see. Keep every reference to them intact and never invent or describe their contents.`
-    );
-  }
+  const hasContext = ctx.threadTitle !== null || ctx.lastOutput !== null;
   const custom2 = ctx.customInstructions?.trim() ?? "";
-  if (custom2.length > 0) {
-    lines.push(`- User preference: ${custom2.slice(0, CUSTOM_INSTRUCTIONS_CAP)}`);
+  return {
+    kindRule: ctx.kind === "follow-up" ? "This draft is a follow-up message in an ongoing conversation \u2014 the agent already has the full context. Keep it a follow-up: sharpen the ask, but do NOT restate background, re-explain the task, or expand it into a standalone spec." : "This draft starts a brand-new task; the rewritten prompt is the agent's entire brief, so make the goal and the definition of done unmistakable.",
+    context: hasContext ? `
+${contextLines.join("\n")}` : null,
+    attachmentRule: ctx.attachmentCount > 0 ? `- The draft carries ${ctx.attachmentCount} attachment(s) you cannot see. Keep every reference to them intact and never invent or describe their contents.` : null,
+    customRule: custom2.length > 0 ? `- User preference: ${custom2.slice(0, CUSTOM_INSTRUCTIONS_CAP)}` : null,
+    // Always a string: a draft that is empty (or whitespace) must still land
+    // inside the fences rather than collapsing the line and shifting them.
+    draft: capped
+  };
+}
+function renderPromptTemplate(template, draft, ctx) {
+  const values = templateValues(draft, ctx);
+  const rendered = [];
+  for (const line of template.split("\n")) {
+    const onlyLine = PLACEHOLDER_ONLY_LINE.exec(line);
+    if (onlyLine !== null && Object.hasOwn(values, onlyLine[1])) {
+      const value = values[onlyLine[1]];
+      if (value !== null) rendered.push(value);
+      continue;
+    }
+    rendered.push(
+      line.replace(PLACEHOLDER, (match, name) => {
+        if (!Object.hasOwn(values, name)) return match;
+        return values[name] ?? match;
+      })
+    );
   }
-  lines.push(
-    "- Return ONLY the rewritten prompt: no preamble, no explanation, no quotes, no markdown fences.",
-    "",
-    "Draft prompt:",
-    '"""',
-    capped,
-    '"""'
-  );
-  return lines.join("\n");
+  return rendered.join("\n");
+}
+function buildEnhancePrompt(draft, ctx, template = DEFAULT_PROMPT_TEMPLATE) {
+  return renderPromptTemplate(template, draft, ctx);
 }
 
 // lib/adaptive-timeout.ts
@@ -14613,6 +14699,7 @@ function startSerialPoll(work, intervalMs) {
 // server.ts
 var REALTIME_CHANNEL = "prompt-enhancer";
 var OVERRIDE_KEY = "model-override";
+var TEMPLATE_KEY = "prompt-template";
 var CATALOG_TTL_MS = 6e4;
 var CATALOG_CACHE_KEY = "model-catalog-cache";
 var PROVIDER_CALL_TIMEOUT_MS = 5e3;
@@ -14746,6 +14833,32 @@ var rpcContract = defineRpcContract({
   getPrefs: {
     input: external_exports.null(),
     output: external_exports.object({ previewBeforeApply: external_exports.boolean() })
+  },
+  /**
+   * The editable enhancer prompt: the effective template, whether it is the
+   * shipped default or the user's own, and the placeholder vocabulary the
+   * settings UI documents.
+   */
+  getPromptTemplate: {
+    input: external_exports.null(),
+    output: external_exports.object({
+      template: external_exports.string(),
+      defaultTemplate: external_exports.string(),
+      isCustom: external_exports.boolean(),
+      maxLength: external_exports.number(),
+      variables: external_exports.array(
+        external_exports.object({ name: external_exports.string(), description: external_exports.string() })
+      )
+    })
+  },
+  setPromptTemplate: {
+    input: external_exports.object({ template: external_exports.string().max(TEMPLATE_CAP) }).strict(),
+    output: external_exports.object({})
+  },
+  /** Drop the user's template and go back to the shipped one. */
+  resetPromptTemplate: {
+    input: external_exports.null(),
+    output: external_exports.object({})
   }
 });
 function toEnhancement(row) {
@@ -15063,6 +15176,20 @@ async function plugin(bb) {
   }
   void refreshCatalog().catch(() => {
   });
+  async function loadPromptTemplate() {
+    try {
+      const stored = await bb.storage.kv.get(TEMPLATE_KEY);
+      if (typeof stored === "string") {
+        const check2 = validatePromptTemplate(stored);
+        if (check2.ok) return { template: stored, isCustom: true };
+        bb.log.warn(
+          `ignoring an unusable saved prompt template: ${check2.errors.join(" ")}`
+        );
+      }
+    } catch {
+    }
+    return { template: DEFAULT_PROMPT_TEMPLATE, isCustom: false };
+  }
   async function runEnhance(id, text, threadId, projectId, attachmentCount) {
     try {
       let resolvedProjectId = projectId;
@@ -15093,9 +15220,10 @@ async function plugin(bb) {
       if (resolvedProjectId === null) {
         throw new Error("No project available to run the enhancement in");
       }
-      const [override, settingsValues] = await Promise.all([
+      const [override, settingsValues, promptTemplate] = await Promise.all([
         bb.storage.kv.get(OVERRIDE_KEY).then((v) => v ?? null),
-        settings.get()
+        settings.get(),
+        loadPromptTemplate()
       ]);
       const customRaw = (settingsValues.customInstructions ?? "").trim();
       const customInstructions = customRaw.length > 0 ? customRaw : null;
@@ -15117,13 +15245,17 @@ async function plugin(bb) {
         // belongs in the composer draft, never the timeline.
         visibility: "hidden",
         title: "Enhance prompt",
-        prompt: buildEnhancePrompt(text, {
-          kind: threadId === null ? "new-task" : "follow-up",
-          attachmentCount,
-          threadTitle,
-          lastOutput,
-          customInstructions
-        })
+        prompt: buildEnhancePrompt(
+          text,
+          {
+            kind: threadId === null ? "new-task" : "follow-up",
+            attachmentCount,
+            threadTitle,
+            lastOutput,
+            customInstructions
+          },
+          promptTemplate.template
+        )
       });
       setChildThread.run(child.id, id);
       const row = byId.get(id);
@@ -15236,6 +15368,28 @@ async function plugin(bb) {
     async getPrefs() {
       const settingsValues = await settings.get();
       return { previewBeforeApply: settingsValues.previewBeforeApply };
+    },
+    async getPromptTemplate() {
+      const { template, isCustom } = await loadPromptTemplate();
+      return {
+        template,
+        defaultTemplate: DEFAULT_PROMPT_TEMPLATE,
+        isCustom,
+        maxLength: TEMPLATE_CAP,
+        variables: TEMPLATE_VARIABLES.map((entry) => ({ ...entry }))
+      };
+    },
+    async setPromptTemplate({ template }) {
+      const check2 = validatePromptTemplate(template);
+      if (!check2.ok) {
+        throw new Error(check2.errors.join(" "));
+      }
+      await bb.storage.kv.set(TEMPLATE_KEY, template);
+      return {};
+    },
+    async resetPromptTemplate() {
+      await bb.storage.kv.delete(TEMPLATE_KEY);
+      return {};
     }
   });
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
@@ -15257,6 +15411,108 @@ async function plugin(bb) {
     stopProgress(row.id);
     fail(row.id, error51 ?? "The enhancement thread failed");
     cleanupChildThread(thread.id);
+  });
+  const VARIABLE_HELP = TEMPLATE_VARIABLES.map(
+    (entry) => `  {{${entry.name}}} \u2014 ${entry.description}`
+  ).join("\n");
+  async function invokingHostId(threadId) {
+    if (threadId === null) return null;
+    try {
+      const thread = await bb.sdk.threads.get({ threadId });
+      if (thread.environmentId === null) return null;
+      const environment = await bb.sdk.environments.get({
+        environmentId: thread.environmentId
+      });
+      return environment.hostId ?? null;
+    } catch {
+      return null;
+    }
+  }
+  bb.cli.register({
+    name: "prompt-enhancer-plus",
+    summary: "Inspect and edit the enhancer prompt template",
+    commands: [
+      {
+        name: "prompt",
+        summary: "Print the enhancer prompt template in effect",
+        usage: "bb prompt-enhancer-plus prompt [--default]"
+      },
+      {
+        name: "prompt-set",
+        summary: "Replace the enhancer prompt template from a file",
+        usage: "bb prompt-enhancer-plus prompt-set <file>"
+      },
+      {
+        name: "prompt-reset",
+        summary: "Restore the shipped enhancer prompt template",
+        usage: "bb prompt-enhancer-plus prompt-reset"
+      }
+    ],
+    async run(argv, ctx) {
+      const [sub, ...rest] = argv;
+      switch (sub) {
+        case "prompt": {
+          const wantDefault = rest.includes("--default");
+          const template = wantDefault ? DEFAULT_PROMPT_TEMPLATE : (await loadPromptTemplate()).template;
+          return { exitCode: 0, stdout: template };
+        }
+        case "prompt-set": {
+          const path = rest.find((entry) => !entry.startsWith("--"));
+          if (path === void 0) {
+            return {
+              exitCode: 1,
+              stderr: "Usage: bb prompt-enhancer-plus prompt-set <file>"
+            };
+          }
+          let template;
+          try {
+            const hostId = await invokingHostId(ctx.threadId ?? null);
+            const file2 = await bb.sdk.files.read({
+              path,
+              ...hostId === null ? {} : { hostId }
+            });
+            template = file2.content;
+          } catch (error51) {
+            const message = error51 instanceof Error ? error51.message : String(error51);
+            return { exitCode: 1, stderr: `Could not read ${path}: ${message}` };
+          }
+          const check2 = validatePromptTemplate(template);
+          if (!check2.ok) {
+            return {
+              exitCode: 1,
+              stderr: [
+                ...check2.errors,
+                "",
+                "Placeholders:",
+                VARIABLE_HELP
+              ].join("\n")
+            };
+          }
+          await bb.storage.kv.set(TEMPLATE_KEY, template);
+          return {
+            exitCode: 0,
+            stdout: `Saved ${template.length} characters. Run \`bb prompt-enhancer-plus prompt\` to verify, or \`bb prompt-enhancer-plus prompt-reset\` to undo.`
+          };
+        }
+        case "prompt-reset": {
+          await bb.storage.kv.delete(TEMPLATE_KEY);
+          return { exitCode: 0, stdout: "Restored the shipped prompt." };
+        }
+        default:
+          return {
+            exitCode: 1,
+            stderr: [
+              "Usage:",
+              "  bb prompt-enhancer-plus prompt [--default]",
+              "  bb prompt-enhancer-plus prompt-set <file>",
+              "  bb prompt-enhancer-plus prompt-reset",
+              "",
+              "Placeholders:",
+              VARIABLE_HELP
+            ].join("\n")
+          };
+      }
+    }
   });
 }
 export {

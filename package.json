@@ -1,6 +1,6 @@
 {
-  "name": "bb-plugin-prompt-enhancer",
-  "version": "0.2.5",
+  "name": "bb-plugin-prompt-enhancer-plus",
+  "version": "0.1.0",
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -8,8 +8,8 @@
     "bbPluginSdk": "^0.4.1"
   },
   "bb": {
-    "name": "Prompt Enhancer",
-    "description": "Rewrites the composer draft into a clearer, more effective prompt using a hidden bb thread.",
+    "name": "Prompt Enhancer Plus",
+    "description": "Rewrites the composer draft into a clearer, more effective prompt using a hidden bb thread — with an enhancer prompt you can edit.",
     "branding": {
       "icon": "AiContentGenerator01"
     },
