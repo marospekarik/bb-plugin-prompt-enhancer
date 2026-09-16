@@ -51,6 +51,7 @@ import {
 } from "@/lib/references";
 import { scopeKey as scopeKeyOf } from "@/lib/scope-key";
 import { nextShown, REVEAL_TICK_MS } from "@/lib/reveal";
+import { useTapActivation } from "@/hooks/useTapActivation";
 
 const isMac = navigator.platform.toUpperCase().includes("MAC");
 const SHORTCUT_HINT = isMac ? "⌘E" : "Ctrl+E";
@@ -305,6 +306,14 @@ function EnhanceButton() {
   // works is exactly when a queued prompt gets refined.
   const startDisabled = busy || view.draft.isEmpty;
   const disabled = !busy && view.draft.isEmpty;
+
+  // The action row sits directly above the keyboard, so a tap here is also the
+  // tap that dismisses it. The dismiss reflows the composer and the browser can
+  // then drop the `click` entirely — press and release both arrive, nothing
+  // runs. Activating on the release instead of waiting for that `click` is what
+  // makes the button work on a phone. Desktop is untouched: a mouse still goes
+  // through `click`.
+  const tap = useTapActivation(() => (busy ? cancel() : void enhance()));
 
   function stopTimers(): void {
     if (timeoutRef.current !== null) {
@@ -808,7 +817,7 @@ function EnhanceButton() {
           busy && "prompt-enhancer-pill-busy",
         )}
         disabled={disabled}
-        onClick={() => (busy ? cancel() : void enhance())}
+        {...tap}
         onMouseEnter={() => setCancelHover(true)}
         onMouseLeave={() => setCancelHover(false)}
         aria-label={busy ? "Cancel enhancement" : "Enhance prompt"}
